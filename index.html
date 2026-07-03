@@ -40,6 +40,7 @@
 <body>
 <canvas id="cnv" width="1536" height="896"></canvas>
 <p>Controls: Arrow keys, X (Jump), Z (Run), Enter (Size), Mouse (Draw)</p>
+<p>Raccoon (large size): run flat-out to fill the P-meter, then tap X repeatedly while airborne to fly &mdash; tap X on the way down to float to a controlled landing.</p>
 <p>
     Speed:
     <button type="button" onClick="targetFPS=15">
@@ -182,6 +183,30 @@
         ctx.beginPath();
         ctx.rect(mpos[0] * 16, mpos[1] * 16, 16, 16);
         ctx.stroke();
+
+        // P-meter HUD (charges while running flat-out; flashing "P" == flight ready)
+        const segs = 7;
+        const full = playerPower >= POWER_FULL;
+        for (let i = 0; i < segs; i++) {
+            const lit = playerPower * segs > i + 0.5;
+            ctx.fillStyle = full
+                ? (Math.floor(Date.now() / 100) % 2 ? '#ff2' : '#fa0')
+                : (lit ? '#fff' : '#444');
+            ctx.fillRect(3 + i * 4, 3, 3, 4);
+        }
+        // flight / tail status indicator
+        ctx.font = '6px monospace';
+        ctx.textBaseline = 'top';
+        if (playerFlyTime > 0) {
+            ctx.fillStyle = '#ff2';
+            ctx.fillText('FLY', 3 + segs * 4 + 2, 2);
+        } else if (full) {
+            ctx.fillStyle = '#fa0';
+            ctx.fillText('P!', 3 + segs * 4 + 2, 2);
+        } else if (playerWagCount > 0 && playerIsBig) {
+            ctx.fillStyle = '#0fa';
+            ctx.fillText('~', 3 + segs * 4 + 2, 2);
+        }
     }
 
     function start() {
@@ -289,12 +314,28 @@
     let playerDX = 0;
     let playerDY = 0;
     let playerInAir = false;
-    let playerIsBig = true;
+    let playerIsBig = true;       // large collision box == Raccoon mode
     let playerIsDucking = false;
+
+    // Raccoon flight / P-meter state (ported from SMB3 prg008.asm)
+    let playerPower = 0;          // P-meter charge, 0..POWER_FULL (Player_Power $03DB)
+    let playerFlyTime = 0;        // remaining raccoon flight (Player_FlyTime, ticks)
+    let playerWagCount = 0;       // remaining tail-wag frames (Player_WagCount)
+    let flyTimeToggle = 0;        // FlyTime drains every other frame
 
     const GRAVITY_SLOW = 1;
     const GRAVITY_FAST = 5;
     const JUMP_FORCE = [-3.5, -3.625, -3.75, -4];
+
+    // SMB3 velocity unit is 1/16 px/frame, so these mirror the ASM constants:
+    const PLAYER_FLY_YVEL = -1.5;       // -$18/16 : rise velocity while flying
+    const PLAYER_FLY_APEX_YVEL = -1.0;  // -$10/16 : weak rise as flight runs out
+    const PLAYER_TAILWAG_YVEL = 1.0;    //  $10/16 : descent cap while tail-floating
+    const POWER_FULL = 1;               // == Player_Power $7F
+    const POWER_CHARGE = 1 / 56;        // ~0.9s of top-speed running fills the meter
+    const POWER_DRAIN = 1 / 168;        // ~2.8s to drain when not running
+    const FLY_TIME = 0x80;              // flight granted by a full-power launch
+    const WAG_COUNT = 0x10;             // tail-wag frames per A press
 
     const world = `
 ########################
@@ -485,17 +526,73 @@
             }
         }
 
+        // P-meter: charge while running flat-out on the ground (Player_RunFlag),
+        // drain it otherwise (unless flight is keeping it pinned full)
+        const runningTopSpeed =
+            input.b &&
+            !playerInAir &&
+            Math.abs(playerDX) >= topSpeed - 0.001;
+        if (runningTopSpeed) {
+            playerPower = Math.min(POWER_FULL, playerPower + POWER_CHARGE);
+        } else if (playerFlyTime <= 0) {
+            playerPower = Math.max(0, playerPower - POWER_DRAIN);
+        }
+
         // handle vertical movement
-        if (hit.a && !playerInAir) {
-            const dx = Math.floor(Math.abs(playerDX));
-            playerDY = JUMP_FORCE[dx];
-            playerInAir = true;
+        if (hit.a) {
+            if (!playerInAir) {
+                const dx = Math.floor(Math.abs(playerDX));
+                playerDY = JUMP_FORCE[dx];
+                playerInAir = true;
+                playerWagCount = 0;
+                // Launching with a full P-meter as a raccoon grants flight time
+                if (playerIsBig && playerPower >= POWER_FULL && playerFlyTime <= 0) {
+                    playerFlyTime = FLY_TIME;
+                }
+            } else if (playerIsBig) {
+                // A fresh A press mid-air wags the tail: rise while flying, or
+                // flutter to a slow, controlled landing once flight runs out
+                playerWagCount = WAG_COUNT;
+            }
         }
         if (playerInAir) {
             if (playerDY < -2 && input.a) {
                 playerDY += GRAVITY_SLOW / 16;
             } else {
                 playerDY += GRAVITY_FAST / 16;
+            }
+
+            // Raccoon tail wag / flight (PRG008_ACEF..AD18)
+            if (playerFlyTime > 0) {
+                // flight time counts down every other frame; emptying it
+                // also empties the P-meter (PRG008_A520)
+                flyTimeToggle ^= 1;
+                if (flyTimeToggle) {
+                    playerFlyTime--;
+                    if (playerFlyTime <= 0) {
+                        playerPower = 0;
+                    }
+                }
+            }
+            if (playerWagCount > 0) {
+                playerWagCount--;
+                // only the raccoon/tanooki tail can change the fall
+                if (playerIsBig && playerDY > PLAYER_FLY_YVEL) {
+                    if (playerFlyTime > 0) {
+                        // FLYING: gain altitude
+                        if (playerFlyTime >= 0x0f) {
+                            playerDY = PLAYER_FLY_YVEL;
+                        } else if (playerFlyTime & 0x08) {
+                            // low on flight: flutter near the apex
+                            playerDY = PLAYER_FLY_APEX_YVEL;
+                        } else {
+                            playerDY = 0;
+                        }
+                    } else if (playerDY >= PLAYER_TAILWAG_YVEL) {
+                        // TAIL FLOAT: cap descent for a controlled landing
+                        playerDY = PLAYER_TAILWAG_YVEL;
+                    }
+                }
             }
         }
 
