@@ -185,10 +185,10 @@
         ctx.stroke();
 
         // P-meter HUD (charges while running flat-out; flashing "P" == flight ready)
-        const segs = 7;
-        const full = playerPower >= POWER_FULL;
+        const segs = PMETER_LEVELS; // 7 segments matching the 7 power levels
+        const full = playerPower >= PMETER_LEVELS;
         for (let i = 0; i < segs; i++) {
-            const lit = playerPower * segs > i + 0.5;
+            const lit = playerPower > i;
             ctx.fillStyle = full
                 ? (Math.floor(Date.now() / 100) % 2 ? '#ff2' : '#fa0')
                 : (lit ? '#fff' : '#444');
@@ -318,7 +318,11 @@
     let playerIsDucking = false;
 
     // Raccoon flight / P-meter state (ported from SMB3 prg008.asm)
-    let playerPower = 0;          // P-meter charge, 0..POWER_FULL (Player_Power $03DB)
+    // P-meter is a 7-bit shift register in the ASM ($01,$03,$07,$0F,$1F,$3F,$7F).
+    // We model it as integer levels 0–7 with frame-countdown timers matching the ASM.
+    let playerPower = 0;          // P-meter level 0..7 (7 == full, maps to ASM $7F)
+    let playerPMeterCnt = 0;      // frame countdown between level changes (Player_PMeterCnt)
+    let playerRunFlag = false;    // true when on ground, holding B, speed >= TOPRUNSPEED
     let playerFlyTime = 0;        // remaining raccoon flight (Player_FlyTime, ticks)
     let playerWagCount = 0;       // remaining tail-wag frames (Player_WagCount)
     let flyTimeToggle = 0;        // FlyTime drains every other frame
@@ -327,13 +331,17 @@
     const GRAVITY_FAST = 5;
     const JUMP_FORCE = [-3.5, -3.625, -3.75, -4];
 
-    // SMB3 velocity unit is 1/16 px/frame, so these mirror the ASM constants:
-    const PLAYER_FLY_YVEL = -1.5;       // -$18/16 : rise velocity while flying
-    const PLAYER_FLY_APEX_YVEL = -1.0;  // -$10/16 : weak rise as flight runs out
-    const PLAYER_TAILWAG_YVEL = 1.0;    //  $10/16 : descent cap while tail-floating
-    const POWER_FULL = 1;               // == Player_Power $7F
-    const POWER_CHARGE = 1 / 56;        // ~0.9s of top-speed running fills the meter
-    const POWER_DRAIN = 1 / 168;        // ~2.8s to drain when not running
+    // SMB3 velocity constants (4.4 fixed point / 16 → px/frame):
+    const PLAYER_TOPWALKSPEED = 1.5;    // $18/16: walk cap (no B)
+    const PLAYER_TOPRUNSPEED  = 2.5;    // $28/16: run cap (holding B)
+    const PLAYER_TOPPOWERSPEED = 3.5;   // $38/16: cap when P-meter full
+    const PLAYER_FLY_YVEL = -1.5;       // -$18/16: rise velocity while flying
+    const PLAYER_FLY_APEX_YVEL = -1.0;  // -$10/16: weak rise as flight runs out
+    const PLAYER_TAILWAG_YVEL = 1.0;    //  $10/16: descent cap while tail-floating
+    const PMETER_LEVELS = 7;            // 7 bits in the shift register
+    const PMETER_CHARGE_FRAMES = 8;     // $08: frames between each charge step while running
+    const PMETER_DRAIN_FRAMES = 24;     // $18: frames between each drain step when not running
+    const PMETER_FULL_HOLD_FRAMES = 16; // $10: delay before drain when full & still running
     const FLY_TIME = 0x80;              // flight granted by a full-power launch
     const WAG_COUNT = 0x10;             // tail-wag frames per A press
 
@@ -489,8 +497,15 @@
             playerY += Math.min(4, playerDY);
         }
 
-        // handle horizontal movement
-        const topSpeed = input.b ? 2.5 : 1.5;
+        // handle horizontal movement — 3 speed tiers (ASM: prg008 Player_GroundHControl)
+        // Determine top speed: walk < run < power
+        let topSpeed = PLAYER_TOPWALKSPEED;  // default: no B
+        if (input.b) {
+            topSpeed = PLAYER_TOPRUNSPEED;   // holding B
+            if (playerPower >= PMETER_LEVELS) {
+                topSpeed = PLAYER_TOPPOWERSPEED; // full P-meter
+            }
+        }
         const accelFric = playerIsBig ? 14 : 10;
         const accelSkid = 32;
         const accelNormal = 14;
@@ -510,7 +525,7 @@
                 }
             }
         } else {
-            const absDX = Math.abs(playerDX)
+            const absDX = Math.abs(playerDX);
             if (
                 (playerDX > 0 && hitDir < 0) ||
                 (playerDX < 0 && hitDir > 0)
@@ -519,34 +534,62 @@
                 playerDX += hitDir * accelSkid / 256;
             } else if (absDX < topSpeed) {
                 playerDX += hitDir * accelNormal / 256;
+                // clamp to topSpeed so we don't overshoot and oscillate
+                if (Math.abs(playerDX) > topSpeed) {
+                    playerDX = hitDir * topSpeed;
+                }
             } else if (absDX > topSpeed) {
                 if (!playerInAir) {
                     playerDX -= hitDir * accelFric / 256;
+                    // don't decelerate past the cap
+                    if (Math.abs(playerDX) < topSpeed) {
+                        playerDX = hitDir * topSpeed;
+                    }
                 }
             }
         }
 
-        // P-meter: charge while running flat-out on the ground (Player_RunFlag),
-        // drain it otherwise (unless flight is keeping it pinned full)
-        const runningTopSpeed =
-            input.b &&
-            !playerInAir &&
-            Math.abs(playerDX) >= topSpeed - 0.001;
-        if (runningTopSpeed) {
-            playerPower = Math.min(POWER_FULL, playerPower + POWER_CHARGE);
-        } else if (playerFlyTime <= 0) {
-            playerPower = Math.max(0, playerPower - POWER_DRAIN);
+        // Player_RunFlag: set when on ground, holding B, speed >= TOPRUNSPEED (ASM PRG008_AB62)
+        playerRunFlag = false;
+        if (input.b && !playerInAir && Math.abs(playerDX) >= PLAYER_TOPRUNSPEED - 0.001) {
+            playerRunFlag = true;
+        }
+
+        // P-meter update (ASM: Player_PowerUpdate in prg008.asm)
+        // Uses frame countdown timer (Player_PMeterCnt) between level changes.
+        // Charge rate: 1 level per 8 frames while RunFlag set.
+        // Drain rate: 1 level per 24 frames when RunFlag clear (unless flying).
+        if (playerFlyTime <= 0) {
+            if (playerPMeterCnt > 0) {
+                playerPMeterCnt--;
+            } else {
+                // Timer expired — advance or drain one level
+                if (playerRunFlag) {
+                    if (playerPower < PMETER_LEVELS) {
+                        playerPower++;
+                        playerPMeterCnt = PMETER_CHARGE_FRAMES;
+                    } else {
+                        // already full, hold it there with a longer timer
+                        playerPMeterCnt = PMETER_FULL_HOLD_FRAMES;
+                    }
+                } else {
+                    if (playerPower > 0) {
+                        playerPower--;
+                        playerPMeterCnt = PMETER_DRAIN_FRAMES;
+                    }
+                }
+            }
         }
 
         // handle vertical movement
         if (hit.a) {
             if (!playerInAir) {
-                const dx = Math.floor(Math.abs(playerDX));
+                const dx = Math.min(3, Math.floor(Math.abs(playerDX)));
                 playerDY = JUMP_FORCE[dx];
                 playerInAir = true;
                 playerWagCount = 0;
                 // Launching with a full P-meter as a raccoon grants flight time
-                if (playerIsBig && playerPower >= POWER_FULL && playerFlyTime <= 0) {
+                if (playerIsBig && playerPower >= PMETER_LEVELS && playerFlyTime <= 0) {
                     playerFlyTime = FLY_TIME;
                 }
             } else if (playerIsBig) {
@@ -562,18 +605,7 @@
                 playerDY += GRAVITY_FAST / 16;
             }
 
-            // Raccoon tail wag / flight (PRG008_ACEF..AD18)
-            if (playerFlyTime > 0) {
-                // flight time counts down every other frame; emptying it
-                // also empties the P-meter (PRG008_A520)
-                flyTimeToggle ^= 1;
-                if (flyTimeToggle) {
-                    playerFlyTime--;
-                    if (playerFlyTime <= 0) {
-                        playerPower = 0;
-                    }
-                }
-            }
+            // Raccoon tail wag / flight effects on Y velocity (PRG008_ACEF..AD18)
             if (playerWagCount > 0) {
                 playerWagCount--;
                 // only the raccoon/tanooki tail can change the fall
@@ -592,6 +624,19 @@
                         // TAIL FLOAT: cap descent for a controlled landing
                         playerDY = PLAYER_TAILWAG_YVEL;
                     }
+                }
+            }
+        }
+
+        // FlyTime countdown runs every frame (ASM: Player_PowerUpdate, PRG008_A4CC)
+        // Drains every other frame; when it reaches 0, P-meter is also cleared.
+        if (playerFlyTime > 0) {
+            flyTimeToggle ^= 1;
+            if (flyTimeToggle) {
+                playerFlyTime--;
+                if (playerFlyTime <= 0) {
+                    playerPower = 0;
+                    playerPMeterCnt = 0;
                 }
             }
         }
