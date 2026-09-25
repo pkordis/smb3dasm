@@ -1,0 +1,170 @@
+ObjInit_PUpMush:
+	JSR Mushroom_SetFall	 ; Figure the way that the mushroom should fall
+
+	LDA #$10	
+	STA Objects_Timer2,X	 ; Object's timer 2 = 16
+
+	; SB: This is probably used by the Big ? block which CAN spawn mushroom/flower/star for some reason
+	LDA PUp_StarManFlash
+	BEQ PRG001_A852	 ; If flashing is NOT active, jump to PRG001_A852
+
+	JSR Mushroom_SetXVel	 ; Set's X velocity appropriately by Player's 
+
+	LDY #-$38
+	JSR Mushroom_SetUpVel	 ; Set vertical velocity and mid air flag
+	JMP PRG001_A859		; Jump to PRG001_A859
+
+PRG001_A852:
+
+	; This will make mushroom drop downward if it was "knocked out" downward
+	LDY #$10	
+	LDA Player_BounceDir
+	BEQ Mushroom_SetUpVel
+
+PRG001_A859:
+	; Delay until rise
+	LDA #$3d
+	STA Objects_Timer,X
+
+	RTS		 ; Return
+
+
+Mushroom_SetUpVel:
+	STY <Objects_YVel,X	 ; Set object's Y velocity
+	STY <Objects_DetStat,X	 ; I think this is a mistake?  They probably meant to clear it?
+	RTS		 ; Return
+PowerUp_DoRaise:
+	LDA Objects_Timer,X
+	BEQ PRG001_A940	 ; If timer expired, jump to PRG001_A940 (will NOT return here if game is halted)
+
+	CMP #$2d
+	BNE PRG001_A8D5	 ; If object timer <> $2D, jump to PRG001_A8D5
+
+	; Play powerup rising sound
+	LDA Sound_QLevel1
+	ORA #SND_LEVELRISE
+	STA Sound_QLevel1
+
+PRG001_A8D5:
+	BGE PRG001_A93D	 ; If timer is >= $2D, jump to PRG001_A93D
+
+	; ObjSplash_DisTimer = 8
+	LDA #$08
+	STA ObjSplash_DisTimer,X
+
+	DEC Objects_Var1,X	 ; Objects_Var1--
+	BPL PRG001_A8F7	 ; If Objects_Var1 >= 0, jump to PRG001_A8F7
+
+	; When var 1 falls below 0, reset to 2
+	LDA #$02
+	STA Objects_Var1,X
+
+	LDA <Player_HaltGame
+	BNE PRG001_A8F7	 ; If game is halted, jump to PRG001_A8F7
+
+
+	; Game not halted...
+
+	; Move powerup up 1 pixel
+	LDA <Objects_Y,X
+	SUB #$01
+	STA <Objects_Y,X
+	LDA <Objects_YHi,X
+	SBC #$00
+	STA <Objects_YHi,X
+
+PRG001_A8F7:
+	JSR Object_ShakeAndDrawMirrored	 ; Draw mirrored sprite
+
+	LDA PUp_StarManFlash
+	ASL A
+	ORA Level_PipeMove
+	BNE PRG001_A937	 ; If starman flashing or Player in pipe, jump to PRG001_A937 (no masking sprite)
+
+	LDY #$00	 ; Y = 0
+
+	JSR Object_AnySprOffscreen
+	BNE PRG001_A937	 ; If any sprite is off-screen, jump to PRG001_A937 (no masking sprite)
+
+	; This puts on the masking sprite over the raising powerup
+
+	LDA <Objects_Y,X
+	AND #$f0	 	; Align object Y to tile
+	ADD #$0f	 	; +15
+	SUB Level_VertScroll	; Calc relative to vertical scroll
+
+	; Set for both sprite halves Y
+	STA Sprite_RAM,Y
+	STA Sprite_RAM+4,Y
+
+	; Masking tile
+	LDA #$77
+	STA Sprite_RAM+1,Y
+	STA Sprite_RAM+5,Y
+
+	; Set sprite priority
+	LDA #%00100000
+	STA Sprite_RAM+2,Y
+	STA Sprite_RAM+6,Y
+
+	; Set sprite X's side by side
+	LDA Objects_SpriteX,X
+	STA Sprite_RAM+3,Y
+	ADD #$08
+	STA Sprite_RAM+7,Y
+
+PRG001_A937:
+	JSR PowerUp_DoHitTest	 ; Hit test power up when it has emerged from the box
+	JSR Object_DeleteOffScreen	 ; Delete object if it falls off screen
+
+PRG001_A93D:
+
+	; Do NOT return to caller!
+	PLA
+	PLA
+
+	RTS		 ; Return
+
+PRG001_A940:
+	LDA <Player_HaltGame
+	BEQ PRG001_A949	 ; If game is NOT halted by Player, jump to PRG001_A949
+
+	; Draw mushroom if game halted
+	JSR Object_ShakeAndDrawMirrored	 ; Draw mirrored sprite
+
+	; Do NOT return to caller!! (JSR could've been a JMP?)
+	PLA
+	PLA
+
+PRG001_A949:
+	RTS		 ; Return
+
+	; Determines which way a mushroom should fall based on Player's position
+Mushroom_SetFall:
+	LDY #$00	 ; Y = 0 (mushroom falls to the left)
+
+	LDA <Objects_X,X
+	SUB <Horz_Scroll	; Make X relative to screen
+	CMP <Player_SpriteX	
+	BLT PRG001_A956	 	; If object X is less than Player's X, jump to PRG001_A956
+
+	INY		 	; Otherwise, Y = 1 (mushroom falls to the right)
+
+PRG001_A956:
+	STY Player_MushFall	; Set direction of mushroom fall
+	RTS		 ; Return
+
+PowerUp_BounceXVel:
+	LDY #$10	 ; Y = $10
+
+	LDA Player_MushFall	
+	BNE PRG001_A963	 ; If falling to right, jump to PRG001_A963
+	LDY #-$10	 ; Otherwise, Y = -$10
+PRG001_A963:
+	STY <Objects_XVel,X	 ; Set X velocity appropriately
+
+
+	RTS		 ; Return
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

@@ -1,0 +1,43 @@
+ObjInit_PUpMush:
+	JSR Mushroom_SetFall	 ; Figure the way that the mushroom should fall
+
+	LDA #$10	
+	STA Objects_Timer2,X	 ; Object's timer 2 = 16
+
+	; SB: This is probably used by the Big ? block which CAN spawn mushroom/flower/star for some reason
+	LDA PUp_StarManFlash
+	BEQ PRG001_A852	 ; If flashing is NOT active, jump to PRG001_A852
+
+	JSR Mushroom_SetXVel	 ; Set's X velocity appropriately by Player's 
+
+	LDY #-$38
+	JSR Mushroom_SetUpVel	 ; Set vertical velocity and mid air flag
+	JMP PRG001_A859		; Jump to PRG001_A859
+
+PRG001_A852:
+
+	; This will make mushroom drop downward if it was "knocked out" downward
+	LDY #$10	
+	LDA Player_BounceDir
+	BEQ Mushroom_SetUpVel
+
+PRG001_A859:
+	; Delay until rise
+	LDA #$3d
+	STA Objects_Timer,X
+
+	RTS		 ; Return
+
+
+Mushroom_SetUpVel:
+	STY <Objects_YVel,X	 ; Set object's Y velocity
+	STY <Objects_DetStat,X	 ; I think this is a mistake?  They probably meant to clear it?
+	RTS		 ; Return
+
+
+Mushroom_SetXVel:
+	LDY #$10	 ; Y = $10
+PowerUp_DoRaise:
+	LDA Objects_Timer,X
+	BEQ PRG001_A940	 ; If timer expired, jump to PRG001_A940 (will NOT return here if game is halted)
+
